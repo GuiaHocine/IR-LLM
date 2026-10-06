@@ -1,257 +1,159 @@
-import pandas as pd
-import os
-os.environ["HF_HOME"] = f"/tempory/{os.environ['USER']}/HF_CACHE"
-os.environ["TRANSFORMERS_CACHE"] = f"/tempory/{os.environ['USER']}/hf_cache_clean"
-os.environ["HF_HUB_CACHE"] = f"/tempory/{os.environ['USER']}/hf_cache_clean"
-os.environ["IR_DATASETS_HOME"] = f"/tempory/{os.environ['USER']}/LLM_DATA"
-import pyterrier as pt
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import ir_measures
-import getpass
-import tarfile
-import urllib.request
+"""Compare RAG answers with Qwen thinking enabled and disabled.
+
+Despite its historical filename this is an experiment command, not a unit test.
+"""
+
+import argparse
+import json
 from pathlib import Path
-from typing import Dict, List, Tuple
-from ir_measures import RR, Recall
-from transformers import AutoTokenizer, AutoModelForCausalLM,AutoModelForMaskedLM,AutoModel
-from utils import SPLADEEncoder,get_text_from_index, get_doc_text,doc_exists_in_index,to_ir_measures_qrels,to_ir_measures_run,clean_query,RAGPipelineSplade,RAGPipelineBM25,judge_answer_quality,strip_think
-import re
-from tqdm import tqdm
-import pyterrier as pt
-import ir_datasets
+
+from ir_llm.config import DEFAULT_DATASET, DEFAULT_GENERATOR, DEFAULT_INDEX, DEFAULT_MAX_DOCS
 
 
-
-
-device = get_best_device()
-
-
-
-""""loading the decoder model""""
-thinking_model_name = "Qwen/Qwen3-0.6B"
-model_name = "Qwen/Qwen3-0.6B"
-# load the tokenizer and the model
-thinking_tokenizer = AutoTokenizer.from_pretrained(model_name)
-thinking_model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype="auto",
-    device_map="auto"
-)
-
-thinking_model.eval()
-device = next(thinking_model.parameters()).device
-
-
-"""" loading the LoTTE Data and index """""
-dataset = pt.get_dataset("irds:lotte/technology/dev/search")
-num_docs = 5000 
-num_queries = 900
-queries_df = dataset.get_topics().head(num_queries)
-qrels_df = dataset.get_qrels()
-query_ids = set(queries_df["qid"].tolist())
-qrels_df = qrels_df[qrels_df["qid"].isin(query_ids)].copy()
-relevant_doc_ids = set(qrels_df["docno"].tolist())
-index_path = Path(f"/tempory/{os.environ['USER']}/LLM_DATA/index_lotte").absolute()
-index = pt.terrier.TerrierIndex(str(index_path))
-
-""" Loading the splade IR model that has been trained in practical 5 """"
-# 1. Re-instantiate the class
-hyperparams = torch.load("splade_model/hyperparams.pt")
-splade_encoder = SPLADEEncoder(sparsity_weight=hyperparams["sparsity_weight"])
-
-# 2. Load the weights
-splade_encoder.load_state_dict(torch.load("splade_model/model_weights.pt"))
-splade_encoder.eval() # Set to evaluation mode
-
-
-"""" RAG USING BM25 RETRIEVAL WITH & WITHOUT THINKING (COT) AND EVALUATED USING SELF CONSISTENCY (LLM AS JUDGE) """"
-
-
-bm25 = index.retriever("BM25")
-doc_id_list = list(relevant_doc_ids)
-rag_bm25_no_thinking = RAGPipelineBM25(
-    retriever=bm25,
-    generator=thinking_model,      
-    generator_tokenizer=thinking_tokenizer,
-    pt_index=index,
-    doc_ids=doc_id_list, 
-    top_k=3,
-    thinking=False,
-)
-rag_bm25_thinking = RAGPipelineBM25(
-    retriever=bm25,
-    generator=thinking_model,      
-    generator_tokenizer=thinking_tokenizer,
-    pt_index=index,
-    doc_ids=doc_id_list, 
-    top_k=3,
-    thinking=True,
-)
-
-results_thinking = []
-results_no_thinking=[]
-
-last_queries = queries_df.tail(50)
-
-for _, row in tqdm(
-    last_queries.iterrows(),
-    total=len(last_queries),
-    desc="Generating RAG answers"
-):
-    query = row["query"]
-
-    out_NT = rag_bm25_no_thinking(query)["generated_answer"]
-    out_T = rag_bm25_thinking(query)["generated_answer"]
-
-    # Strip thinking
-    if "</think>" in out_T:
-        out_T = out_T.split("</think>")[-1].strip()
-
-    results_thinking.append({
-        "qid": row["qid"],
-        "query": query,
-        "generated_answer": out_NT
-    })
-    results_no_thinking.append({
-        "qid": row["qid"],
-        "query": query,
-        "generated_answer": out_T
-    })
-rag_results_bm25_thinking = pd.DataFrame(results_thinking)
-rag_results_bm25_no_thinking = pd.DataFrame(result_no_thinking)
-
-judge_scores_thinking = []
-judge_scores_no_thinking = []
-
-for _, row in tqdm(rag_results_bm25_thinking.iterrows(), total=len(rag_results_bm25_thinking), desc="LLM-as-Judge"):
-    judge_scores_thinking = judge_answer_quality(
-        judge_model=thinking_model,              # or your judge model
-        judge_tokenizer=thinking_tokenizer,      # or judge tokenizer
-        query=row["query"],
-        answer=row["generated_answer"],
-        max_new_tokens=256,
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument("--index-path", type=Path, default=DEFAULT_INDEX)
+    parser.add_argument(
+        "--max-docs", type=int, default=DEFAULT_MAX_DOCS, help="Corpus limit (default: 5000)"
     )
-    judge_scores_thinking.append(judge_scores_thinking)
-
-for _, row in tqdm(rag_results_bm25_no_thinking.iterrows(), total=len(rag_results_bm25_no_thinking), desc="LLM-as-Judge"):
-    judge_scores_no_thinking = judge_answer_quality(
-        judge_model=thinking_model,              # or your judge model
-        judge_tokenizer=thinking_tokenizer,      # or judge tokenizer
-        query=row["query"],
-        answer=row["generated_answer"],
-        max_new_tokens=256,
+    parser.add_argument("--generator-model", default=DEFAULT_GENERATOR)
+    parser.add_argument("--encoder-model", type=Path, help="Saved SPLADE checkpoint directory")
+    parser.add_argument("--retriever", choices=("bm25", "splade", "both"), default="bm25")
+    parser.add_argument("--queries-file", type=Path, help="JSON query records exported by training")
+    parser.add_argument("--num-queries", type=int, default=10)
+    parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--skip-judge", action="store_true", help="Export answers without self-judging"
     )
-    judge_scores_no_thinking.append(judge_scores_no_thinking)
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/rag"))
+    return parser
 
 
-judge_df_thinking = pd.DataFrame(judge_scores_thinking)
-scored_df_thinking = pd.concat([rag_results_bm25_thinking .reset_index(drop=True), judge_df_thinking], axis=1)
-final_result_thinking_bm25=scored_df_thinking[["relevance", "helpfulness"]].mean()
-
-judge_df_no_thinking = pd.DataFrame(judge_scores_no_thinking)
-scored_df__no_thinking = pd.concat([rag_results_bm25_no_thinking .reset_index(drop=True), judge_df_no_thinking], axis=1)
-final_result_no_thinking_bm25=scored_df_thinking[["relevance", "helpfulness"]].mean()
-
-
-
-
-"""" RAG USING SPLADE TRAINED RETRIEVAL by distilling cross-encoder  WITH & WITHOUT THINKING (COT) AND EVALUATED USING SELF CONSISTENCY (LLM AS JUDGE) """"
-
-doc_id_list = list(relevant_doc_ids)
-
-rag_splade_no_thinking = RAGPipelineSplade(
-    retriever=splade_encoder,
-    generator=thinking_model,          
-    generator_tokenizer=thinking_tokenizer,
-    pt_index=index,
-    doc_ids=doc_id_list,              
-    top_k=3,
-    thinking=False,
-    device = device
-)
-
-rag_splade_thinking = RAGPipelineSplade(
-    retriever=splade_encoder,
-    generator=thinking_model,          
-    generator_tokenizer=thinking_tokenizer,
-    pt_index=index,
-    doc_ids=doc_id_list,             
-    top_k=3,
-    thinking=True,
-    device = device
-)
+def evaluate_pipeline(pipeline, queries, judge=None, max_new_tokens=1024):
+    """Keep each answer and judge result attached to its query and mode."""
+    records = []
+    for thinking in (False, True):
+        pipeline.thinking = thinking
+        for query in queries:
+            retrieved = pipeline.retrieve(query["query"])
+            texts = pipeline._get_texts([doc_id for doc_id, _ in retrieved])
+            context = "\n\n".join(texts.get(doc_id, "")[:1000] for doc_id, _ in retrieved)
+            answer = pipeline.generate(query["query"], context, max_new_tokens=max_new_tokens)
+            record = {
+                "qid": str(query["qid"]),
+                "query": query["query"],
+                "thinking": thinking,
+                "retrieved_docs": retrieved,
+                "generated_answer": answer,
+            }
+            if judge is not None:
+                record["judge"] = judge(query["query"], answer)
+            records.append(record)
+    return records
 
 
-results_thinking = []
-results_no_thinking =[]
+def summarize_scores(records):
+    """Report valid judge counts alongside means; failed judgments remain visible."""
+    summary = {}
+    for thinking in (False, True):
+        rows = [row for row in records if row["thinking"] == thinking]
+        scores = {}
+        for metric in ("relevance", "helpfulness"):
+            values = [
+                row.get("judge", {}).get(metric)
+                for row in rows
+                if type(row.get("judge", {}).get(metric)) is int and 1 <= row["judge"][metric] <= 5
+            ]
+            scores[metric] = {
+                "mean": sum(values) / len(values) if values else None,
+                "valid": len(values),
+                "total": len(rows),
+            }
+        summary["thinking" if thinking else "no_thinking"] = scores
+    return summary
 
-last_queries = queries_df.tail(50)
 
-for _, row in tqdm(
-    last_queries.iterrows(),
-    total=len(last_queries),
-    desc="Generating RAG answers"
-):
-    query = row["query"]
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for name in ("num_queries", "top_k", "max_new_tokens"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.max_docs is not None and args.max_docs < 1:
+        parser.error("--max-docs must be positive")
+    if args.retriever in ("splade", "both") and (
+        args.encoder_model is None or not args.encoder_model.is_dir()
+    ):
+        parser.error("--encoder-model must point to a saved SPLADE checkpoint")
 
-    out_NT = rag_splade_no_thinking(query)["generated_answer"]
-    out_T = rag_splade_thinking(query)["generated_answer"]
+    from ir_llm.data import index_document_ids, load_dataset, load_or_create_index
+    from ir_llm.models import SPLADEEncoder
+    from ir_llm.rag import RAGPipelineBM25, RAGPipelineSplade, judge_answer_quality
+    from ir_llm.runtime import load_generator, select_device, set_seed
 
-    # Strip thinking
-    if "</think>" in out_T:
-        out_T = out_T.split("</think>")[-1].strip()
-
-    results_thinking.append({
-        "qid": row["qid"],
-        "query": query,
-        "generated_answer": out_NT
-    })
-    results_no_thinking.append({
-        "qid": row["qid"],
-        "query": query,
-        "generated_answer": out_T
-    })
-rag_results_splade_thinking = pd.DataFrame(results_thinking)
-rag_results_splade_no_thinking = pd.DataFrame(result_no_thinking)
-
-judge_scores_thinking = []
-judge_scores_no_thinking = []
-
-for _, row in tqdm(rag_results_bm25_thinking.iterrows(), total=len(rag_results_splade_thinking), desc="LLM-as-Judge"):
-    judge_scores_thinking = judge_answer_quality(
-        judge_model=thinking_model,              # or your judge model
-        judge_tokenizer=thinking_tokenizer,      # or judge tokenizer
-        query=row["query"],
-        answer=row["generated_answer"],
-        max_new_tokens=256,
+    set_seed(args.seed)
+    device = select_device(args.device)
+    dataset, topics, _ = load_dataset(args.dataset)
+    index = load_or_create_index(dataset, args.index_path, max_docs=args.max_docs)
+    if args.queries_file:
+        queries = json.loads(args.queries_file.read_text(encoding="utf-8"))[: args.num_queries]
+    else:
+        queries = topics.tail(args.num_queries)[["qid", "query"]].to_dict("records")
+    if not queries:
+        parser.error("No queries available for evaluation")
+    tokenizer, generator = load_generator(args.generator_model, device)
+    common = dict(
+        generator=generator,
+        generator_tokenizer=tokenizer,
+        pt_index=index,
+        doc_ids=[],
+        top_k=args.top_k,
     )
-    judge_scores_thinking.append(judge_scores_thinking)
+    pipelines = {}
+    if args.retriever in ("bm25", "both"):
+        pipelines["bm25"] = RAGPipelineBM25(retriever=index.retriever("BM25"), **common)
+    if args.retriever in ("splade", "both"):
+        config_path = args.encoder_model / "splade_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        encoder = SPLADEEncoder(
+            str(args.encoder_model), sparsity_weight=config.get("sparsity_weight", 0.0001)
+        ).to(device)
+        encoder.eval()
+        common["doc_ids"] = index_document_ids(index)
+        pipelines["splade"] = RAGPipelineSplade(retriever=encoder, device=device, **common)
 
-for _, row in tqdm(rag_results_bm25_no_thinking.iterrows(), total=len(rag_results_splade_no_thinking), desc="LLM-as-Judge"):
-    judge_scores_no_thinking = judge_answer_quality(
-        judge_model=thinking_model,              # or your judge model
-        judge_tokenizer=thinking_tokenizer,      # or judge tokenizer
-        query=row["query"],
-        answer=row["generated_answer"],
-        max_new_tokens=256,
+    judge = None
+    if not args.skip_judge:
+
+        def judge(query, answer):
+            return judge_answer_quality(generator, tokenizer, query, answer)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    summary = {}
+    for name, pipeline in pipelines.items():
+        records = evaluate_pipeline(pipeline, queries, judge, args.max_new_tokens)
+        (args.output_dir / f"{name}_answers.json").write_text(
+            json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        summary[name] = summarize_scores(records)
+    report = {
+        "config": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "scores": summary,
+        "evaluation": "Same-model judgments are exploratory ratings, not ground-truth accuracy.",
+    }
+    (args.output_dir / "summary.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
-    judge_scores_no_thinking.append(judge_scores_no_thinking)
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
-judge_df_thinking = pd.DataFrame(judge_scores_thinking)
-scored_df_thinking = pd.concat([rag_results_bm25_thinking .reset_index(drop=True), judge_df_thinking], axis=1)
-final_result_thinking_splade=scored_df_thinking[["relevance", "helpfulness"]].mean()
-
-judge_df_no_thinking = pd.DataFrame(judge_scores_no_thinking)
-scored_df__no_thinking = pd.concat([rag_results_bm25_no_thinking .reset_index(drop=True), judge_df_no_thinking], axis=1)
-final_result_no_thinking_splade=scored_df_thinking[["relevance", "helpfulness"]].mean()
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    raise SystemExit(main())

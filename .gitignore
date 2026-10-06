@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.env
+.env.*
+data/
+outputs/
+GENERATED_DATA/
+splade_model/
+training_data_for_splade*.json
+*.pt
+*.safetensors

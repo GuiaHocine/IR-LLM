@@ -1,361 +1,179 @@
-import shutil
-import torch
-import pyterrier as pt
-import pandas as pd
+"""Generate synthetic search-query/document pairs for SPLADE training.
+
+Generation uses documents relevant to the training query split. Documents relevant
+to held-out queries are excluded. Importing this module has no model side effects.
+"""
+
+import argparse
+import json
+import random
+import re
 from pathlib import Path
-from collections import Counter
-from typing import List, Tuple, Dict
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from tqdm.auto import tqdm
-from rouge_score import rouge_scorer
-from evaluate import load as load_metric
-from utils get_best_device
+
+from ir_llm.config import DEFAULT_DATASET, DEFAULT_INDEX, DEFAULT_MAX_DOCS
+from IR_training_evaluation import positive_int, split_queries
 
 
-device = get_best_device()
-# Load a model for generation
-#
-# Options (uncomment ONE model_name):
-#
-# 1. SmolLM2-1.7B float16 (~3.4GB) - default, works on all platforms
-model_name = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-#
-# 2. Pre-quantized models (GPTQ/AWQ) - Linux only, requires:
-#    uv pip install auto-gptq autoawq  (or: uv sync --extra quantized)
-# model_name = "Qwen/Qwen2.5-3B-Instruct-AWQ"  # 3B AWQ, ~2GB
-# model_name = "Qwen/Qwen2.5-7B-Instruct-AWQ"  # 7B AWQ, ~4GB
+def split_numbered_questions(text):
+    """Parse one-question-per-line output, including numbered or bulleted lists."""
+    text = text.strip()
+    if not text:
+        return []
+    lines = text.splitlines()
+    marker = r"^\s*(?:\d+[.)]\s*|[-*]\s+)"
+    has_list = any(re.match(marker, line) for line in lines)
+    questions = []
+    for line in lines:
+        if has_list and not re.match(marker, line):
+            continue
+        line = re.sub(marker, "", line).strip()
+        line = line.strip("\"'").strip()
+        if line and line.casefold() not in {question.casefold() for question in questions}:
+            questions.append(line)
+    return questions
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# Detect if model is pre-quantized (AWQ/GPTQ) by name
-is_quantized = "AWQ" in model_name or "GPTQ" in model_name
-
-if is_quantized:
-    # Pre-quantized models need autoawq/auto-gptq (Linux only)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-    )
-    print(f"Model loaded: {model_name} (pre-quantized)")
-else:
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=torch.float16,
-    )
-    model = model.to(device)
-    print(f"Model loaded: {model_name} on {device}")
-
-model.eval()
-
-def build_prompt(user: str, system: str = "You are a helpful assistant.") -> str:
-    """Build a chat-format prompt using the tokenizer's chat template."""
+def build_prompt(tokenizer, document, num_queries=2, max_doc_length=1500):
     messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
+        {
+            "role": "system",
+            "content": "You write search queries grounded in the supplied document.",
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Write exactly {num_queries} distinct search questions that this document answers. "
+                "Return only the questions, one numbered question per line, with no introduction.\n\n"
+                f"Document:\n{document[:max_doc_length]}"
+            ),
+        },
     ]
     return tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
     )
 
-@torch.no_grad()
-def generate_text(
-    prompt: str,
-    max_new_tokens: int = 100,
-    temperature: float = 0.7,
-    do_sample: bool = True,
-    num_return_sequences: int = 1,
-) -> list[str]:
-    """Generate text from a prompt."""
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=do_sample,
-        num_return_sequences=num_return_sequences,
-        pad_token_id=tokenizer.eos_token_id,
-    )
+def generate_text(model, tokenizer, prompt, max_new_tokens=200):
+    """Decode only the newly generated tokens, preserving the actual answer text."""
+    import torch
 
-    # Decode and extract only the response
-    generated = []
-    for output in outputs:
-        text = tokenizer.decode(output, skip_special_tokens=True)
-        # Extract the part after the last "assistant"
-        if "assistant" in text.lower():
-            text = text.split("assistant")[-1].strip()
-        generated.append(text)
-
-    return generated
-
-dataset = pt.get_dataset("irds:lotte/technology/dev/search")
-irds = dataset.irds_ref()
-pt.java.init()
-pt.terrier.set_property("querying.parser", "MatchOpQLParser")
-queries_df = dataset.get_topics()
-qrels_df = dataset.get_qrels()
-
-# Index the entire corpus with PyTerrier (or load existing index)
-# We store document text in metadata for retrieval during RAG
-index_path = Path(f"/tempory/{os.environ['USER']}/LLM_DATA/index_lotte").absolute()
-
-# Check if index already exists
-if (index_path / "data.properties").exists():
-    print(f"Loading existing index from {index_path}")
-    index_ref = str(index_path)
-else:
-    print(f"Creating new index at {index_path}")
-    if index_path.is_dir():
-        shutil.rmtree(index_path)
-    index_path.mkdir(parents=True, exist_ok=True)
-
-    indexer = pt.IterDictIndexer(
-        str(index_path),
-        overwrite=True,
-        meta={"docno": 50, "text": 4096},  # Store text in metadata
-        meta_reverse=["docno"],
-    )
-
-    # Index the corpus - PyTerrier handles iteration efficiently
-    print("Indexing corpus...")
-    index_ref = indexer.index(dataset.get_corpus_iter())
-
-# Get index statistics
-index = pt.IndexFactory.of(index_ref, memory={"meta": True})
-meta_index = index.getMetaIndex()
-
-# Helper functions to get document text from index (uses cached meta_index)
-def get_doc_text(meta_index, doc_id: str) -> str:
-    """Retrieve document text from PyTerrier index metadata."""
-    try:
-        docid = meta_index.getDocument("docno", doc_id)
-        if docid >= 0:
-            return meta_index.getItem("text", docid)
-    except Exception:
-        pass
-    return ""
-
-
-def get_text_from_index(meta_index, doc_ids: list[str]) -> dict[str, str]:
-    """Retrieve text for multiple documents from the index metadata."""
-    result = {}
-    for doc_id in doc_ids:
-        try:
-            docid = meta_index.getDocument("docno", doc_id)
-            if docid >= 0:
-                result[doc_id] = meta_index.getItem("text", docid)
-        except Exception:
-            pass
-    return result
-    
-# Configuration for query generation
-num_docs_to_augment = 250 # Number of documents to generate queries for
-queries_per_doc = 2  # Number of queries to generate per document
-
-def generate_queries_for_document(
-    document: str,
-    num_queries: int = 2,
-    max_doc_length: int = 500,
-) -> List[str]:
-    """
-    Generate search queries that the document would answer.
-
-    Args:
-        document: The document text
-        num_queries: Number of queries to generate
-        max_doc_length: Maximum document length to use
-
-    Returns:
-        List of generated queries
-    """
-    # Implement query generation
-
-    doc_excerpt = document[:max_doc_length]
-    prompt = f"Given this document : {doc_excerpt} , generate {num_queries} search queries that the document would answer , the queries should not be the same  "
-    prompt_new = build_prompt(prompt)
-    response = generate_text(prompt_new, max_new_tokens=200, temperature=0.1)
-    return response
-
-def generate_training_pairs(
-    index_ref,
-    qrels_df: pd.DataFrame,
-    num_docs: int = 1,
-    queries_per_doc: int = 2,
-) -> List[Dict]:
-    """
-    Generate query-document training pairs.
-
-    Args:
-        index_ref: PyTerrier index reference
-        qrels_df: DataFrame with qrels (to get document IDs)
-        num_docs: Number of documents to process
-        queries_per_doc: Queries to generate per document
-
-    Returns:
-        List of {"query": str, "doc_id": str, "document": str}
-    """
-    # Generate training pairs
-
-    # 1. Sample documents from the corpus (use qrels to get doc IDs)
-    # 2. Generate queries for each document
-    # 3. Create training pairs
-    import random
-    doc_ids = qrels_df["docno"].unique().tolist()
-    sampled_ids = random.sample(doc_ids, min(num_docs, len(doc_ids)))
-    training_pairs = []
-
-    # Use the existing meta_index from the global scope
-    global meta_index
-
-    for doc_id in tqdm(sampled_ids):
-        doc_text = get_doc_text(meta_index, doc_id)
-        if not doc_text:
-            continue
-
-        generated_queries = generate_queries_for_document(doc_text, num_queries=queries_per_doc)
-
-        for query in generated_queries:
-            training_pairs.append(
-                {
-                    "query": query,
-                    "doc_id": doc_id,
-                    "document": doc_text,
-                    "source": "synthetic",
-                }
-            )
-    return training_pairs
-
-
-# Generate synthetic training pairs
-synthetic_pairs = generate_training_pairs(
-    index_ref,
-    qrels_df,
-    num_docs=1000,
-    queries_per_doc=3,
-)
-def create_combined_training_data(
-    index_ref,
-    qrels_df: pd.DataFrame,
-    queries_df: pd.DataFrame,
-    synthetic_pairs: List[Dict],
-) -> List[Dict]:
-    """
-    Combine real qrels with synthetic pairs.
-
-    Args:
-        index_ref: PyTerrier index reference
-        qrels_df: Original relevance judgments
-        queries_df: Original queries
-        synthetic_pairs: Synthetically generated pairs
-
-    Returns:
-        Combined list of training pairs
-    """
-    training_data = []
-
-    # Add real pairs from qrels
-    for _, row in qrels_df.iterrows():
-        qid = row["qid"]
-        doc_id = row["docno"]
-
-        query_rows = queries_df[queries_df["qid"] == qid]["query"].values
-        if len(query_rows) == 0:
-            continue
-
-        doc_text = get_doc_text(meta_index, doc_id)
-        if not doc_text:
-            continue
-
-        training_data.append(
-            {
-                "query": query_rows[0],
-                "doc_id": doc_id,
-                "document": doc_text,
-                "source": "qrels",  # From original dataset
-            }
+    inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
         )
+    return tokenizer.decode(
+        outputs[0, inputs["input_ids"].shape[-1] :], skip_special_tokens=True
+    ).strip()
 
-    # Add synthetic pairs
-    training_data.extend(synthetic_pairs)
 
-    return training_data
+def generate_queries_for_document(model, tokenizer, document, num_queries=2, max_doc_length=1500):
+    prompt = build_prompt(tokenizer, document, num_queries, max_doc_length)
+    response = generate_text(model, tokenizer, prompt, max_new_tokens=max(100, num_queries * 60))
+    return split_numbered_questions(response)[:num_queries]
 
-import json
 
-# Prepare data for saving (don't include full document text to save space)
-training_export = []
-for pair in synthetic_pairs:
-    training_export.append(
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
+    parser.add_argument("--index-path", type=Path, default=DEFAULT_INDEX)
+    parser.add_argument(
+        "--max-docs",
+        type=positive_int,
+        default=DEFAULT_MAX_DOCS,
+        help="Corpus limit (default: 5000)",
+    )
+    parser.add_argument("--model", default="HuggingFaceTB/SmolLM2-1.7B-Instruct")
+    parser.add_argument("--num-docs", type=positive_int, default=100)
+    parser.add_argument("--queries-per-doc", type=positive_int, default=2)
+    parser.add_argument("--num-queries", type=positive_int, default=900)
+    parser.add_argument("--test-queries", type=positive_int, default=100)
+    parser.add_argument("--output", type=Path, default=Path("outputs/synthetic_pairs.json"))
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    return parser
+
+
+def select_training_documents(train_qrels, test_qrels, num_docs, seed=42, available_doc_ids=None):
+    """Avoid generating augmentation from any held-out relevant document."""
+    excluded = set(test_qrels.loc[test_qrels["label"] > 0, "docno"].astype(str))
+    candidates = sorted(
+        set(train_qrels.loc[train_qrels["label"] > 0, "docno"].astype(str)) - excluded
+    )
+    if available_doc_ids is not None:
+        available = {str(doc_id) for doc_id in available_doc_ids}
+        candidates = [doc_id for doc_id in candidates if doc_id in available]
+    return random.Random(seed).sample(candidates, min(num_docs, len(candidates)))
+
+
+def run(args):
+    import torch
+    from tqdm.auto import tqdm
+
+    from ir_llm.data import index_document_ids, load_dataset, load_or_create_index
+    from ir_llm.retrieval import get_doc_text
+    from ir_llm.runtime import load_generator, select_device
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    dataset, topics, qrels = load_dataset(args.dataset)
+    train_topics, test_topics = split_queries(
+        topics.head(args.num_queries), args.test_queries, args.seed
+    )
+    train_qrels = qrels[qrels["qid"].isin(train_topics["qid"])]
+    test_qrels = qrels[qrels["qid"].isin(test_topics["qid"])]
+    index = load_or_create_index(dataset, args.index_path, max_docs=args.max_docs)
+    doc_ids = select_training_documents(
+        train_qrels, test_qrels, args.num_docs, args.seed, index_document_ids(index)
+    )
+    if not doc_ids:
+        raise ValueError("No eligible training documents remain after excluding held-out documents")
+    # Filter before loading a potentially large generator.
+    documents = [(doc_id, get_doc_text(index, doc_id)) for doc_id in doc_ids]
+    documents = [(doc_id, text) for doc_id, text in documents if text]
+    if not documents:
+        raise ValueError("None of the selected documents occur in the index; increase --max-docs")
+    tokenizer, model = load_generator(args.model, select_device(args.device))
+    pairs = []
+    for doc_id, document in tqdm(documents, desc="Generating queries"):
+        for query in generate_queries_for_document(
+            model, tokenizer, document, args.queries_per_doc
+        ):
+            pairs.append({"query": query, "doc_id": doc_id, "source": "synthetic"})
+    if not pairs:
+        raise ValueError("The model produced no queries")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(pairs, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    manifest = {
+        key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+    }
+    manifest.update(
         {
-            "query": pair["query"],
-            "doc_id": pair["doc_id"],
-            "source": pair["source"],
+            "training_query_ids": train_topics["qid"].astype(str).tolist(),
+            "test_query_ids": test_topics["qid"].astype(str).tolist(),
+            "num_pairs": len(pairs),
         }
     )
-
-output_dir = Path("./GENERATED_DATA")
-output_dir.mkdir(parents=True, exist_ok=True)
-output_path = output_dir / "training_data_for_splade.json"
-with open(output_path, "w", encoding="utf-8") as f:
-    json.dump(training_export, f, indent=2)
-
-print(f"Saved {len(training_export)} training pairs to {output_path}")
+    args.output.with_suffix(".config.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"Saved {len(pairs)} training pairs to {args.output}")
+    return pairs
 
 
-
-import json
-import re
-
-IN_PATH = "GENERATED_DATA/training_data_for_splade.json"
-OUT_PATH = "training_data_for_splade_qrels_style_split.json"
-
-def split_numbered_questions(q: str) -> list[str]:
-    """
-    Split strings like:
-      '1. question one\n2. question two'
-    into ['question one', 'question two'].
-
-    If it doesn't look like a numbered list, return [q].
-    """
-    s = q.strip()
-
-    # Detect numbered lines: start of line has digits + dot
-    if not re.search(r"(?m)^\s*\d+\.\s+", s):
-        return [s]
-
-    # Split on the numbered markers, keep only the content parts
-    parts = re.split(r"(?m)^\s*\d+\.\s+", s)
-    parts = [p.strip() for p in parts if p.strip()]
-
-    # Clean surrounding quotes if present
-    cleaned = []
-    for p in parts:
-        p = p.strip().strip('"').strip("'").strip()
-        if p:
-            cleaned.append(p)
-
-    return cleaned if cleaned else [s]
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.test_queries >= args.num_queries:
+        parser.error("--test-queries must be smaller than --num-queries")
+    try:
+        run(args)
+    except (ValueError, FileNotFoundError) as error:
+        parser.error(str(error))
 
 
-with open(IN_PATH, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-out = []
-for item in data:
-    q = item["query"]
-    doc_id = item["doc_id"]
-    source = item["source"]
-
-    # Only split synthetic combined queries; keep qrels as-is
-    if source == "synthetic":
-        subqueries = split_numbered_questions(q)
-        for sq in subqueries:
-            out.append({"query": sq, "doc_id": doc_id, "source": source})
-    else:
-        out.append(item)
-
-with open(OUT_PATH, "w", encoding="utf-8") as f:
-    json.dump(out, f, ensure_ascii=False, indent=2)
-
-print(f"Saved: {OUT_PATH} | before={len(data)} after={len(out)}")
-
+if __name__ == "__main__":
+    main()
